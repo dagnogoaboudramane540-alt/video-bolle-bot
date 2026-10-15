@@ -8,6 +8,7 @@ from pathlib import Path
 
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -32,6 +33,21 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # limite della Bot API per inviare file
 MAX_SECONDS = 60  # durata massima di una video nota
 SIZE = 384  # lato del quadrato in pixel (piu' basso = piu' veloce)
 FFMPEG_TIMEOUT = 900  # secondi massimi per una conversione
+
+
+def _read_id(name):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    return raw  # per esempio @nomecanale
+
+
+OWNER_ID = _read_id("OWNER_ID")
+if not isinstance(OWNER_ID, int):
+    OWNER_ID = None
+CHANNEL_ID = _read_id("CHANNEL_ID")
 
 
 class ConversionError(Exception):
@@ -73,33 +89,31 @@ async def convert_to_video_note(src: Path, dst: Path) -> None:
         raise ConversionError("ffmpeg non e' riuscito a convertire il file")
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "Ciao! Mandami un video e te lo restituisco come video bolla rotonda.\n"
-        "Il video viene ritagliato quadrato e tagliato a 60 secondi se e' piu' lungo. "
-        "Dimensione massima del file: 20 MB."
-    )
+def get_video_media(message):
+    if message is None:
+        return None
+    if message.video:
+        return message.video
+    doc = message.document
+    if doc and (doc.mime_type or "").startswith("video/"):
+        return doc
+    return None
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "Mandami un video dalla galleria e lo trasformo in una video bolla."
-    )
-
-
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def process_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media, to_channel: bool) -> None:
     message = update.effective_message
     chat_id = update.effective_chat.id
 
-    media = message.video or message.document
-    if media is None:
-        return
-
-    if message.document and not (message.document.mime_type or "").startswith(
-        "video/"
-    ):
-        await message.reply_text("Questo file non sembra un video. Mandami un video.")
-        return
+    if to_channel:
+        if OWNER_ID is None or CHANNEL_ID is None:
+            await message.reply_text("La funzione canale non e' ancora configurata.")
+            return
+        user = update.effective_user
+        if user is None or user.id != OWNER_ID:
+            await message.reply_text(
+                "Solo il proprietario del bot puo' pubblicare nel canale."
+            )
+            return
 
     if media.file_size and media.file_size > MAX_DOWNLOAD_BYTES:
         await message.reply_text(
@@ -112,6 +126,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     status = await message.reply_text(
         "Sto convertendo il video, puo' richiedere qualche minuto..."
     )
+    target = CHANNEL_ID if to_channel else chat_id
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,7 +151,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
             with dst.open("rb") as video_file:
                 await context.bot.send_video_note(
-                    chat_id=chat_id,
+                    chat_id=target,
                     video_note=video_file,
                     length=SIZE,
                     duration=duration,
@@ -144,6 +159,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     write_timeout=180,
                 )
 
+        if to_channel:
+            await message.reply_text("Fatto: video bolla pubblicata nel canale.")
         if original_duration and original_duration > MAX_SECONDS:
             await message.reply_text(
                 "Nota: il video durava piu' di 60 secondi, ho tenuto solo il primo minuto."
@@ -156,6 +173,21 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text(
             "Non sono riuscito a convertire questo video. Il formato potrebbe non essere valido."
         )
+    except TelegramError as error:
+        logger.error("Errore Telegram: %s", type(error).__name__)
+        if "too big" in str(error).lower():
+            await message.reply_text(
+                "Il video e' troppo grande: il limite e' 20 MB."
+            )
+        elif to_channel:
+            await message.reply_text(
+                "Non riesco a scrivere nel canale. Controlla che il bot sia "
+                "amministratore del canale e che CHANNEL_ID sia corretto."
+            )
+        else:
+            await message.reply_text(
+                "Si e' verificato un errore con Telegram. Riprova tra poco."
+            )
     except Exception:
         logger.exception("Errore durante l'elaborazione del video")
         await message.reply_text(
@@ -166,6 +198,61 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await status.delete()
         except Exception:
             pass
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "Ciao! Mandami un video e te lo restituisco come video bolla rotonda.\n"
+        "Per pubblicarlo nel canale rispondi al video con /canale "
+        "(oppure invialo con la didascalia /canale).\n"
+        "Il video viene ritagliato quadrato e tagliato a 60 secondi se e' piu' lungo. "
+        "Dimensione massima del file: 20 MB."
+    )
+
+
+async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user is not None:
+        await update.effective_message.reply_text(f"Il tuo ID utente: {user.id}")
+
+
+async def report_channel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    origin = getattr(message, "forward_origin", None)
+    chat = getattr(origin, "chat", None)
+    if chat is not None and getattr(chat, "type", "") == "channel":
+        await message.reply_text(f"ID del canale: {chat.id}")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "Mandami un video dalla galleria e lo trasformo in una video bolla."
+    )
+
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    media = get_video_media(message)
+    if media is None:
+        if message.document:
+            await message.reply_text(
+                "Questo file non sembra un video. Mandami un video."
+            )
+        return
+    caption = (message.caption or "").strip().lower()
+    to_channel = caption.startswith("/canale")
+    await process_media(update, context, media, to_channel)
+
+
+async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    media = get_video_media(message.reply_to_message)
+    if media is None:
+        await message.reply_text(
+            "Rispondi a un video con /canale, oppure invia un video con la didascalia /canale."
+        )
+        return
+    await process_media(update, context, media, True)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -203,10 +290,20 @@ def main() -> None:
     )
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("id", show_id))
+    application.add_handler(CommandHandler("canale", channel_command))
     application.add_handler(
         MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video)
     )
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(
+        MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, report_channel_id),
+        group=1,
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~filters.FORWARDED, handle_text
+        )
+    )
     application.add_error_handler(error_handler)
 
     logger.info("Avvio del bot in modalita' webhook sulla porta %s", port)
